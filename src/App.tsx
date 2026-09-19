@@ -13,8 +13,8 @@ import { useLocalStorage } from './hooks/useLocalStorage';
 import { Modal } from './components/Modal';
 import {
   type Product, type Genre, DEFAULT_GENRES, DEFAULT_KEYWORDS, DUMMY_PRODUCTS,
-  autoParseSpecs,
 } from './data';
+import { searchByJanCode, getCachedProduct, type ProductSearchResult } from './lib/productSearch';
 import {
   type Group, type Member, type MemberRank, CURRENT_USER, INITIAL_GROUP,
   INITIAL_MEMBERS, canManage, canManageGenres, rankColor,
@@ -76,7 +76,7 @@ export default function App() {
   const [products, setProducts] = useLocalStorage<Product[]>('nojima_products_v3', DUMMY_PRODUCTS);
   const [keywords, setKeywords] = useLocalStorage<Record<string, string[]>>('nojima_keywords_v3', DEFAULT_KEYWORDS);
   const [genres, setGenres] = useLocalStorage<Genre[]>('nojima_genres_v3', DEFAULT_GENRES);
-  const [specCache, setSpecCache] = useLocalStorage<Record<string, { modelNumber: string; maker: string; cpu: string; ssd: string; memory: string }>>('nojima_spec_cache_v1', {});
+  const [specCache, setSpecCache] = useLocalStorage<Record<string, { name: string; modelNumber: string; maker: string; description: string; price: number | null; specs: Record<string, string> }>>('nojima_spec_cache_v2', {});
   const [group, setGroup] = useLocalStorage<Group>('nojima_group_v3', INITIAL_GROUP);
   const [members, setMembers] = useLocalStorage<Member[]>('nojima_members_v3', INITIAL_MEMBERS);
   const [currentUser, setCurrentUser] = useState<Member>(CURRENT_USER);
@@ -219,11 +219,12 @@ export default function App() {
       setSpecCache((prev) => ({
         ...prev,
         [updated.janCode]: {
+          name: updated.name,
           modelNumber: updated.modelNumber ?? '',
           maker: updated.maker ?? '',
-          cpu: updated.cpu ?? '',
-          ssd: updated.ssd ?? '',
-          memory: updated.memory ?? '',
+          description: updated.description,
+          price: updated.price,
+          specs: {},
         },
       }));
     }
@@ -247,11 +248,12 @@ export default function App() {
       setSpecCache((prev) => ({
         ...prev,
         [product.janCode]: {
+          name: product.name,
           modelNumber: product.modelNumber ?? '',
           maker: product.maker ?? '',
-          cpu: product.cpu ?? '',
-          ssd: product.ssd ?? '',
-          memory: product.memory ?? '',
+          description: product.description,
+          price: product.price,
+          specs: {},
         },
       }));
     }
@@ -1154,10 +1156,10 @@ function EditProductModal({ product, allKeywords, onSave, onClose }: {
   );
 }
 
-// ===== Add Product Modal (JAN scan + auto-parse specs + manual edit) =====
-function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose }: { genreId: string; existingProducts: Product[]; specCache: Record<string, { modelNumber: string; maker: string; cpu: string; ssd: string; memory: string }>; onSave: (p: Product) => void; onClose: () => void }) {
+// ===== Add Product Modal (JAN scan → real API lookup → manual fallback) =====
+function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose }: { genreId: string; existingProducts: Product[]; specCache: Record<string, { name: string; modelNumber: string; maker: string; description: string; price: number | null; specs: Record<string, string> }>; onSave: (p: Product) => void; onClose: () => void }) {
   const [dupError, setDupError] = useState('');
-  const [step, setStep] = useState<'scan' | 'input' | 'confirm'>('scan');
+  const [step, setStep] = useState<'scan' | 'input' | 'loading' | 'confirm'>('scan');
   const [janCode, setJanCode] = useState('');
   const [scanError, setScanError] = useState('');
   const [name, setName] = useState('');
@@ -1170,6 +1172,9 @@ function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose
   const [memory, setMemory] = useState('');
   const [strengths, setStrengths] = useState('');
   const [cacheLoaded, setCacheLoaded] = useState(false);
+  const [apiNotFound, setApiNotFound] = useState(false);
+  const [apiError, setApiError] = useState('');
+  const [searchResult, setSearchResult] = useState<ProductSearchResult | null>(null);
 
   const checkDuplicate = (code: string): Product | undefined => {
     return existingProducts.find((p) => p.janCode === code);
@@ -1178,15 +1183,68 @@ function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose
   const applyCache = (code: string) => {
     const cached = specCache[code];
     if (cached) {
+      setName(cached.name || '');
       setModelNumber(cached.modelNumber || '');
       setMaker(cached.maker || '');
-      setCpu(cached.cpu || '');
-      setSsd(cached.ssd || '');
-      setMemory(cached.memory || '');
+      setDescription(cached.description || '');
+      if (cached.price != null) setPrice(String(cached.price));
+      if (cached.specs) {
+        setCpu(cached.specs['CPU'] ?? '');
+        setSsd(cached.specs['SSD'] ?? '');
+        setMemory(cached.specs['メモリ'] ?? '');
+      }
       setCacheLoaded(true);
-    } else {
-      setCacheLoaded(false);
+      return true;
     }
+    setCacheLoaded(false);
+    return false;
+  };
+
+  const fetchProductInfo = async (code: string) => {
+    setStep('loading');
+    setApiError('');
+    setApiNotFound(false);
+
+    // まずローカルキャッシュ（specCache）を確認
+    if (applyCache(code)) {
+      setStep('confirm');
+      return;
+    }
+
+    // Edge Function経由でYahoo!ショッピングAPIを呼び出し
+    try {
+      const result = await searchByJanCode(code);
+      setSearchResult(result);
+
+      if (result.found) {
+        // APIから取得した本物のデータをフォームに反映
+        setName(result.name || '');
+        setModelNumber(result.modelNumber || '');
+        setMaker(result.maker || '');
+        setDescription(result.description || '');
+        if (result.price != null) setPrice(String(result.price));
+        if (result.specs) {
+          setCpu(result.specs['CPU'] ?? '');
+          setSsd(result.specs['SSD'] ?? '');
+          setMemory(result.specs['メモリ'] ?? '');
+        }
+        setApiNotFound(false);
+      } else {
+        // データが見つからなかった場合 — ダミーデータは生成せず、手入力フォームを表示
+        setApiNotFound(true);
+        if (result.reason === 'API_KEY_NOT_CONFIGURED') {
+          setApiError('商品情報APIが未設定です。型番とスペックを手入力してください。');
+        } else if (result.reason === 'NO_RESULTS') {
+          setApiError('該当する商品情報が見つかりませんでした。型番とスペックを手入力してください。');
+        } else {
+          setApiError('商品情報の取得に失敗しました。型番とスペックを手入力してください。');
+        }
+      }
+    } catch {
+      setApiNotFound(true);
+      setApiError('商品情報の取得中にエラーが発生しました。型番とスペックを手入力してください。');
+    }
+    setStep('confirm');
   };
 
   const handleScan = (results: { rawValue: string }[]) => {
@@ -1204,8 +1262,7 @@ function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose
     }
     setDupError('');
     setJanCode(value);
-    applyCache(value);
-    setStep('confirm');
+    fetchProductInfo(value);
   };
 
   const handleManualInput = () => {
@@ -1221,18 +1278,15 @@ function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose
     }
     setScanError('');
     setDupError('');
-    applyCache(janCode);
-    setStep('confirm');
+    fetchProductInfo(janCode);
   };
 
-  // confirm画面に入った時にスペックを推定（キャッシュがない場合のみ）
-  const autoFillSpecs = () => {
-    if (cacheLoaded) return;
-    const specs = autoParseSpecs(name, description, janCode);
-    setMaker(specs.maker);
-    setCpu(specs.cpu);
-    setSsd(specs.ssd);
-    setMemory(specs.memory);
+  const resetToScan = () => {
+    setStep('scan');
+    setJanCode('');
+    setName(''); setModelNumber(''); setMaker(''); setCpu(''); setSsd(''); setMemory('');
+    setPrice(''); setDescription(''); setStrengths('');
+    setCacheLoaded(false); setApiNotFound(false); setApiError(''); setSearchResult(null);
   };
 
   const handleSave = () => {
@@ -1296,6 +1350,13 @@ function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose
           </div>
         </div>
       )}
+      {step === 'loading' && (
+        <div className="py-12 text-center space-y-3">
+          <div className="inline-flex w-12 h-12 rounded-full border-4 border-slate-200 border-t-blue-600 animate-spin" />
+          <p className="text-sm text-slate-600">JANコードから商品情報を取得しています...</p>
+          <p className="text-xs text-slate-400">しばらくお待ちください</p>
+        </div>
+      )}
       {step === 'confirm' && (
         <div className="space-y-4">
           <div className="rounded-lg bg-blue-50 border border-blue-100 px-4 py-3 space-y-2">
@@ -1312,19 +1373,36 @@ function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose
                   <CopyButton text={modelNumber} />
                 </>
               ) : (
-                <span className="text-sm text-slate-400">未入力（下記フォームに入力してください）</span>
+                <span className="text-sm text-slate-400">未取得（下記フォームに入力してください）</span>
               )}
             </div>
             <p className="text-xs text-slate-500">末尾3桁: <span className="font-semibold">{janCode.slice(-3)}</span></p>
           </div>
           {cacheLoaded && (
             <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-3 py-2 text-sm text-emerald-700">
-              このJANコードは過去に登録済みです。スペック情報をキャッシュから読み込みました。
+              このJANコードは過去に登録済みです。商品情報をキャッシュから読み込みました。
+            </div>
+          )}
+          {apiNotFound && (
+            <div className="rounded-lg bg-amber-50 border border-amber-200 px-4 py-3 space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-semibold text-amber-800">該当する商品情報が見つかりませんでした</p>
+                  <p className="text-xs text-amber-700 mt-1">{apiError}</p>
+                  <p className="text-xs text-amber-600 mt-1">型番・スペック・価格を手入力して登録できます。</p>
+                </div>
+              </div>
+            </div>
+          )}
+          {searchResult?.found && searchResult.source === 'yahoo_api' && (
+            <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-3 py-2 text-sm text-emerald-700">
+              Yahoo!ショッピングAPIから商品情報を取得しました。
             </div>
           )}
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1.5">商品名</label>
-            <input type="text" value={name} onChange={(e) => setName(e.target.value)} onBlur={autoFillSpecs}
+            <input type="text" value={name} onChange={(e) => setName(e.target.value)}
               placeholder="商品名を入力..." autoFocus
               className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
@@ -1340,14 +1418,9 @@ function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose
               className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
 
-          {/* 自動解析スペック（手動修正可能） */}
+          {/* 基本スペック（手動入力可） */}
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2">
-            <div className="flex items-center justify-between">
-              <label className="text-sm font-semibold text-slate-700">基本スペック（手動入力可）</label>
-              {!cacheLoaded && (
-                <button onClick={() => { const specs = autoParseSpecs(name, description, janCode); setMaker(specs.maker); setCpu(specs.cpu); setSsd(specs.ssd); setMemory(specs.memory); }} className="text-xs text-blue-600 hover:text-blue-700 font-medium">商品名から推定</button>
-              )}
-            </div>
+            <label className="text-sm font-semibold text-slate-700">基本スペック（手動入力可）</label>
             {specFields.map((f) => (
               <div key={f.label} className="flex items-center gap-2">
                 <div className="flex items-center gap-1 w-20 flex-shrink-0">
@@ -1380,7 +1453,7 @@ function AddProductModal({ genreId, existingProducts, specCache, onSave, onClose
               className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none" />
           </div>
           <div className="flex gap-3 pt-2">
-            <button onClick={() => { setStep('scan'); setJanCode(''); setModelNumber(''); setMaker(''); setCpu(''); setSsd(''); setMemory(''); setCacheLoaded(false); }} className="flex-1 px-4 py-2.5 bg-slate-100 text-slate-600 rounded-lg text-sm font-medium hover:bg-slate-200 transition-colors">読み直す</button>
+            <button onClick={resetToScan} className="flex-1 px-4 py-2.5 bg-slate-100 text-slate-600 rounded-lg text-sm font-medium hover:bg-slate-200 transition-colors">読み直す</button>
             <button onClick={handleSave} disabled={!name.trim() || !price} className="flex-1 px-4 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 transition-colors">登録する</button>
           </div>
         </div>

@@ -1,0 +1,3 @@
+[functions.yahoo-product-search]
+verify_jwt = false
+entrypoint = "./functions/yahoo-product-search/index.ts"
