@@ -11,6 +11,7 @@ export type Group = {
   id: string;
   name: string;
   inviteToken: string;
+  password: string;
   createdAt: string;
 };
 
@@ -25,6 +26,7 @@ export const INITIAL_GROUP: Group = {
   id: 'nojima-a',
   name: 'ノジマA店',
   inviteToken: 'NOJIMA-A-2026',
+  password: '',
   createdAt: '2026-09-01',
 };
 
